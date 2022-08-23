@@ -1,0 +1,183 @@
+#!/bin/bash
+# -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
+
+## Copyright 2018-2020, Lancaster University
+## All rights reserved.
+## 
+## Redistribution and use in source and binary forms, with or without
+## modification, are permitted provided that the following conditions are
+## met:
+## 
+##  * Redistributions of source code must retain the above copyright
+##    notice, this list of conditions and the following disclaimer.
+## 
+##  * Redistributions in binary form must reproduce the above copyright
+##    notice, this list of conditions and the following disclaimer in the
+##    documentation and/or other materials provided with the
+##    distribution.
+## 
+##  * Neither the name of the copyright holder nor the names of
+##    its contributors may be used to endorse or promote products derived
+##    from this software without specific prior written permission.
+## 
+## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+##
+##
+## Author: Steven Simpson <https://github.com/simpsonst>
+
+VPNMGRHOME="$(readlink -f "${0%/*}")"
+VPNMGRHOME="${VPNMGRHOME%/share/vpnmgr}"
+
+source "$VPNMGRHOME/share/vpnmgr/settings.sh"
+
+prepare_settings
+VPNUSER=vpns
+homedir=/var/lib/vpnmgr
+declare -A keys
+declare -A patterns
+
+while [ $# -gt 0 ] ; do
+    arg="$1"
+    shift
+
+    case "$arg" in
+        (-f)
+            SOURCE_CONFIG="$1"
+            shift
+            ;;
+
+        (--help|-h)
+            cat <<EOF
+usage: $0 [options] [pubkey-files]
+-f CONFIG ($SOURCE_CONFIG)
+        Sepcify read-only configuration.
+--home=HOME
+-H HOME ($homedir)
+        If an account is to be created, set this as its home
+        directory.
+--user=USER
+-u USER ($VPNUSER)
+        Ensure the account USER exists.
+--match=PATTERN
+-m PATTERN
+        Search SSH authorization files for SSH keys with comments
+        matching PATTERN.  Install these keys as administrators.
+EOF
+            exit
+            ;;
+        (--home=*)
+            homedir="${arg#--home=}"
+            ;;
+        (-H)
+            homedir="$1"
+            shift
+            ;;
+
+        (--match=*)
+            patterns["${arg#--match=}"]=yes
+            shift
+            ;;
+        (-m)
+            patterns["$1"]=yes
+            shift
+            ;;
+
+        (--user=*)
+            VPNUSER="${arg#--user=}"
+            ;;
+        (-u)
+            VPNUSER="$1"
+            shift
+            ;;
+
+        (-*)
+            printf >&2 '%s: unknown switch: %s\n' "$0" "$arg"
+            exit 1
+            ;;
+
+        (*)
+            keys["$arg"]=yes
+            ;;
+    esac
+done
+
+complete_settings
+
+## Ensure the user exists, and record whether we've just had to create
+## it.  If the user already exists, get its actual home directory, not
+## necessarily the one we're expecting.
+if userline="$(getent passwd "$VPNUSER")"
+then
+    printf >&2 'User %s exists\n' "$VPNUSER"
+    unset cre
+    homedir="$(echo "$userline" | cut -d: -f6)"
+else
+    printf 'Creating user %s...\n' "$VPNUSER"
+    useradd --create-home \
+            --home-dir "$homedir" \
+            --shell /bin/bash \
+            --no-user-group \
+            --system \
+            "$VPNUSER" || exit $?
+    cre=1
+fi
+
+## Permit the user to invoke a subset of privileged commands, such as
+## starting and stopping an OpenVPN subservice, or changing OpenVPN
+## configuration.  This might already be present, but overwrite it
+## anyway, in case we're trying to update the path to the script.
+tee > /dev/null /etc/sudoers.d/99-vpnmgr-"$VPNUSER".tmp <<EOF
+$VPNUSER ALL = (root) NOPASSWD: $VPNMGRHOME/share/vpnmgr/privact
+EOF
+mv /etc/sudoers.d/99-vpnmgr-"$VPNUSER".tmp /etc/sudoers.d/99-vpnmgr-"$VPNUSER"
+
+args=(--root)
+
+## Ensure the authorization database exists, and ensure the provided
+## keys are administrators.
+for keyfile in "${!keys[@]}" ; do
+    if [ ! -r "$keyfile" ] ; then
+        printf >&2 '%s: unreadable\n' "$keyfile"
+        continue
+    fi
+    read -r keytype key64 comment < "$keyfile"
+    args+=(--admin "$keytype" "$key64" "$comment")
+done
+
+## Scan the caller's SSH keys for ones matching the comment patterns.
+CALLER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+AUTHZ_FILES+=("$CALLER_HOME/.ssh/authorized_keys")
+AUTHZ_FILES+=("$CALLER_HOME/.ssh/authorized_keys2")
+for src in "${AUTHZ_FILES[@]}" ; do
+    if [ -r "$src" ] ; then
+        printf >&2 'Reading %s...\n' "$src"
+        while read -r keytype key64 comment ; do
+            case "$keytype" in
+                (ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-ed25519|ssh-dss|ssh-rsa)
+                    for pat in "${!patterns[@]}" ; do
+                        if ! [[ "$comment" == $pat ]] ; then
+                            continue
+                        fi
+                        printf >&2 '  Matched %s %s...\n' "$keytype" "$comment"
+                        args+=(--admin "$keytype" "$key64" "$comment")
+                        break
+                    done
+                    ;;
+            esac
+        done < "$src"
+    fi
+done
+
+## Rebuild the authorization file from the database.
+sudo -H -u "$VPNUSER" $VPNMGRHOME/share/vpnmgr/rebuild-auth --lock \
+     -f "$SOURCE_CONFIG" -u "$VPNUSER" "${args[@]}"

@@ -1,0 +1,869 @@
+#!/bin/bash
+# -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
+
+## Copyright 2018-2020, Lancaster University
+## All rights reserved.
+## 
+## Redistribution and use in source and binary forms, with or without
+## modification, are permitted provided that the following conditions are
+## met:
+## 
+##  * Redistributions of source code must retain the above copyright
+##    notice, this list of conditions and the following disclaimer.
+## 
+##  * Redistributions in binary form must reproduce the above copyright
+##    notice, this list of conditions and the following disclaimer in the
+##    documentation and/or other materials provided with the
+##    distribution.
+## 
+##  * Neither the name of the copyright holder nor the names of
+##    its contributors may be used to endorse or promote products derived
+##    from this software without specific prior written permission.
+## 
+## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+##
+##
+## Author: Steven Simpson <https://github.com/simpsonst>
+
+VPNMGRHOME="$(readlink -f "${0%/*}")"
+VPNMGRHOME="${VPNMGRHOME%/sbin}"
+
+source "$VPNMGRHOME/share/vpnmgr/ip.sh"
+source "$VPNMGRHOME/share/vpnmgr/chunks.sh"
+source "$VPNMGRHOME/share/vpnmgr/header.sh"
+
+function callssh () {
+    ssh "$SERVER" ${SSHKEYFILE+-i "$SSHKEYFILE"} false
+}
+
+function write_config () {
+    if [ -z "$OVPNFILE" ] ; then return ; fi
+    {
+        printf 'client\n'
+        printf 'dev tap\n'
+        printf 'proto udp\n'
+        printf 'pull\n'
+        printf 'nobind\n'
+        printf 'cipher AES-256-CBC\n'
+        if [ -n "${SETTING[SUBJECT]}" ] ; then
+            printf 'verify-x509-name '"'%s'"' subject\n' "${SETTING[SUBJECT]}"
+        fi
+        printf 'remote-cert-tls server\n'
+        printf 'remote %s\n' "${SETTING[HOST]}"
+        printf 'rport %s\n' "${SETTING[PORT]}"
+        printf '<ca>\n%s</ca>\n' "$CACERT"
+    } > "$OVPNFILE"
+}
+
+function show_help () {
+    cat >&2 <<EOF
+usage: vpnmgr ACTION [options]
+--server=SERVER
+-s SERVER
+        SSH into SERVER, instead of 'vpns'.
+-i SSHKEYFILE
+        Use private key in SSHKEYFILE to reach server.
+--bank=BANK
+-b BANK
+        Select bank BANK.
+--match=PATTERN
+-m PATTERN
+        Add pattern to match comments in SSH authorization files.  Can
+        be specified multiple times.
+--public=SSHPUBKEY
+-P SSHPUBKEY
+        Include SSH public keys in file SSHPUBKEY.  Can be specified
+        multiple times.
+--ca=CACERTFILE
+--no-ca
+        Set the certificate authority to the contents of CACERTFILE
+        (in .pem format).
+--ovpn=OVPNFILE
+        Write the partial OpenVPN configuration to OVPNFILE.
+--crl=CRLFILE
+--no-crl
+        Set the certificate revocation list.
+--authz=AUTHZFILE
+--no-authz
+        Set the authorization file.
+--enable
+--disable
+        Enable/disable VPN.
+--route=SUBNET
+        Add or remove a route.  Gateway and metric are set by most
+        recent --(no-)gateway and --(no-)metric options.
+--gateway=IP
+        Set the gateway for subsequent --route options.
+--no-gateway
+        Cause subsequent --route options to remove routes.
+--metric=INTEGER
+        Set the metric for subsequent --route options.
+--no-metric
+        Cause subsequent --route options to specify no metric.
+--domain=DNSDOMAIN
+        Set the DNS domain pushed to clients.
+--no-domain
+        Unset the DNS domain pushed to clients.
+--dns=IP,IP,...
+        Set the DNS servers pushed to clients.
+--no-dns
+        Unset the DNS servers pushed to clients.
+--vlan=VLAN
+-v VLAN
+        Set the VLAN id or range (e.g., 1-20,25,30-40).
+--port=PORT
+-p PORT
+        External UDP port to expose the VLAN through.
+--network=START-END/MASKLEN
+-n START-END/MASKLEN
+        Set the first available client IP to START, the last to END,
+        and the length of the netmask to MASKLEN.  The network IP is
+        derived from START & netmask, which must be identical to END &
+        netmask.
+
+test
+        Invoke SSH, but send no command and quit immediately.  Use
+        this to check the connection, accept new server identities,
+        etc.
+admin [--bank] [--vlan]
+manage [--bank] [--vlan]
+read [--bank] [--vlan]
+forbid [--bank] [--vlan]
+        Set permissions of SSH public keys on input for
+        administrating/managing/reading.
+list [--bank]
+        List each defined VPN's VLAN id, port and status on a line.
+        VLAN can be set to a range to limit the results.
+create [--network] [--ca] [--bank] [--vlan] [--crl] [--port] [--enable]
+        Create a VPN into a VLAN (which may be a range, from which an
+        available id will be chosen randomly).  The port may also be a
+        range, from which an available one will be chosen.
+update [--network] [--ca] [--bank] [--vlan] [--crl] [--enable] [--disable]
+        Update an existing VPN's parameters.
+destroy --vlan [--bank]
+        Destroy the VPN into the specified VLAN (a single id, not a
+        range).
+status --vlan [--bank]
+        Show status of VPN.
+clients --vlan [--bank]
+        List current VPN clients.
+config --vlan [--bank] [--ovpn] [--authz]
+        Get the partial OpenVPN configuration for the VPN on the
+        specified VLAN (a single id, not a range).  OVPNFILE will
+        contain a partial OpenVPN configuration.
+EOF
+}
+
+function write_bodies () {
+    declare -A bits=()
+    while [ $# -gt 0 ] ; do
+        local arg="$1" ; shift
+        local req="${arg:0:-1}"
+        arg="${arg%+}"
+        case "${arg^^}" in
+            (CRL)
+                if [ "$CRLFILE" ] ; then
+                    if [ ! -r "$CRLFILE" ] ; then
+                        printf >&2 'No CRL file: %s\n' "$CRLFILE"
+                        exit 1
+                    fi
+                    bits["${arg^^}"]=yes
+                elif [ "$req" = '+' ] ; then
+                    printf >&2 'CRL required\n'
+                    exit 1
+                elif [ "$NO_CRLFILE" ] ; then
+                    printf 'NO-CRL=yes\n'
+                fi
+                ;;
+            (CERT)
+                if [ "$CACERTFILE" ] ; then
+                    if [ ! -r "$CACERTFILE" ] ; then
+                        printf >&2 'No certificate file: %s\n' "$CACERTFILE"
+                        exit 1
+                    fi
+                    bits["${arg^^}"]=yes
+                elif [ "$req" = '+' ] ; then
+                    printf >&2 'Certificate required\n'
+                    exit 1
+                elif [ "$NO_CACERTFILE" ] ; then
+                    printf 'NO-CERT=yes\n'
+                fi
+                ;;
+            (AUTHZ)
+                if [ "$AUTHZFILE" ] ; then
+                    if [ ! -r "$AUTHZFILE" ] ; then
+                        printf >&2 'No authorization file: %s\n' "$AUTHZFILE"
+                        exit 1
+                    fi
+                    bits["${arg^^}"]=yes
+                elif [ "$req" = '+' ] ; then
+                    printf >&2 'Authorization file required\n'
+                    exit 1
+                elif [ "$NO_AUTHZFILE" ] ; then
+                    printf 'NO-AUTHZ=yes\n'
+                fi
+                ;;
+            (SSHKEYS)
+                bits["${arg^^}"]=yes
+                ;;
+            (ROUTING)
+                if [ "${#RTGWS[@]}" -gt 0 ] ; then
+                    bits["${arg^^}"]=yes
+                fi
+                ;;
+            (*)
+                printf >&2 'Warning: not sending %s\n' "$arg"
+                ;;
+        esac
+    done
+    if [ "${#bits[@]}" -gt 0 ] ; then
+        printf 'CONTENT=%s\n' "${!bits[*]}"
+    fi
+    printf '\n'
+    local bit
+    for bit in "${!bits[@]}" ; do
+        case "$bit" in
+            (CRL)
+                printf >&2 'Transmitting CRL\n'
+                {
+                    cat "$CRLFILE"
+                    printf 'x'
+                } | encode_chunks
+                ;;
+            (CERT)
+                printf >&2 'Transmitting CA certificate authenticating clients\n'
+                {
+                    cat "$CACERTFILE"
+                    printf 'x'
+                } | encode_chunks
+                ;;
+            (AUTHZ)
+                printf >&2 'Transmitting authorization file\n'
+                {
+                    cat "$AUTHZFILE"
+                    printf 'x'
+                } | encode_chunks
+                ;;
+            (SSHKEYS)
+                printf >&2 'Transmitting SSH public keys\n'
+                local key64
+                for key64 in "${!KEYTYPE[@]}" ; do
+                    printf '%s %s %s\n' "${KEYTYPE["$key64"]}" \
+                           "$key64" "${KEYCOMMENT["$key64"]}"
+                done | encode_chunks
+                ;;
+            (ROUTING)
+                printf >&2 'Transmitting routing modifications\n'
+                # declare >&2 -p RTGWS RTMETRICS
+                local cidr nw nm
+                for cidr in "${!RTGWS[@]}" ; do
+                    nw="${cidr%/*}"
+                    nm="${cidr#*/}"
+                    # printf >&2 '0x%08x 0x%08x 0x%08x %s\n' "$nw" "$nm" \
+                        #        "${RTGWS["$cidr"]}" "${RTMETRICS["$cidr"]}"
+                    printf '0x%08x 0x%08x 0x%08x %s\n' "$nw" "$nm" \
+                           "${RTGWS["$cidr"]}" "${RTMETRICS["$cidr"]}"
+                done | encode_chunks
+                ;;
+            (*)
+                printf >&2 'Unreachable code!\n'
+                exit 1
+                ;;
+        esac
+    done
+}
+
+function read_content () {
+    local CONTENT=() content
+    #printf >&2 'Response content: [%s]\n' "${SETTING[CONTENT]}"
+    mapfile -d ' ' -t CONTENT < <(printf '%s' "${SETTING[CONTENT]^^}")
+    for content in "${CONTENT[@]}" ; do
+        case "$content" in
+            ("")
+                true
+                ;;
+            (CACERT)
+                CACERT="$(decode_chunks)"
+                CACERT="${CACERT:0:-1}"
+                printf >&2 'Received CA certificate authenticating server\n'
+                ;;
+            (VPNSTATUS)
+                VPNSTATUS="$(decode_chunks)"
+                VPNSTATUS="${VPNSTATUS:0:-1}"
+                printf >&2 'Received VPN status\n'
+                ;;
+            (CLIENTLIST)
+                CLIENTLIST="$(decode_chunks)"
+                CLIENTLIST="${CLIENTLIST:0:-1}"
+                printf >&2 'Received client list\n'
+                ;;
+            (VPNLIST)
+                VPNLIST="$(decode_chunks)"
+                VPNLIST="${VPNLIST:0:-1}"
+                printf >&2 'Received VPN list\n'
+                ;;
+            (AUTHZ)
+                AUTHZBODY="$(decode_chunks)"
+                AUTHZBODY="${AUTHZBODY:0:-1}"
+                printf >&2 'Received authorization file\n'
+                ;;
+            (*)
+                printf >&2 'Warning: response content %s ignored\n' "$content"
+                decode_chunks > /dev/null
+                ;;
+        esac
+    done
+}
+
+SERVER=vpns
+
+ACTION="$1"
+shift
+
+unset VLAN SSHKEYFILE
+unset SUBNET NO_SUBNET
+unset CACERTFILE NO_CACERTFILE
+unset CRLFILE NO_CRLFILE
+unset OVPNFILE
+BANK=default
+unset PORTCHOICE
+unset ACTIVATION
+
+unset AUTHZFILE NO_AUTHZFILE
+
+declare -A SSHKEYFILE
+declare -A KEYPATTERN
+
+declare -A KEYTYPE
+declare -A KEYCOMMENT
+
+declare -A RTGWS=() RTMETRICS=()
+curgw="$(ip2int 0.0.0.0)"
+unset curmetr
+
+unset DNSDOMAIN NO_DNSDOMAIN
+unset DNSSERVER NO_DNSSERVER
+unset TAILOR
+
+while [ $# -gt 0 ] ; do
+    arg="$1"
+    shift
+    case "$arg" in
+        (--port=*)
+            PORTCHOICE="${arg#--*=}"
+            ;;
+        (-p)
+            PORTCHOICE="$1"
+            shift
+            ;;
+        (--no-dns)
+            NO_DNSSERVER=yes
+            unset DNSSERVER
+            ;;
+        (--dns=*)
+            DNSSERVER="${arg#--*=}"
+            DNSSERVER=(${DNSSERVER//,/ })
+            for i in "${!DNSSERVER[@]}" ; do
+                DNSSERVER["$i"]="$(ip2int "${DNSSERVER["$i"]}")"
+            done
+            unset NO_DNSSERVER
+            ;;
+        (--no-domain)
+            NO_DNSDOMAIN=yes
+            unset DNSDOMAIN
+            ;;
+        (--domain=*)
+            DNSDOMAIN="${arg#--*=}"
+            unset NO_DNSDOMAIN
+            ;;
+        (--no-metric)
+            unset curmetr
+            ;;
+        (--metric=*)
+            curmetr=$(("${arg#--*=}"))
+            ;;
+        (--no-gateway)
+            curgw="$(ip2int 0.0.0.0)"
+            ;;
+        (--gateway=*)
+            curgw="$(ip2int "${arg#--*=}")"
+            ;;
+        (--route=*)
+            cidr=($(subnet2ints "${arg#--*=}"))
+            cidr="${cidr[1]}/${cidr[2]}"
+            RTGWS["$cidr"]="$curgw"
+            RTMETRICS["$cidr"]="$curmetr"
+            ;;
+        (--match=*)
+            KEYPATTERN["${arg#--*=}"]=yes
+            ;;
+        (-m)
+            KEYPATTERN["$1"]=yes
+            shift
+            ;;
+        (--public=*)
+            SSHKEYFILE["${arg#--*=}"]=yes
+            ;;
+        (-P)
+            SSHKEYFILE["$1"]=yes
+            shift
+            ;;
+        (--enable)
+            ACTIVATION=ENABLE
+            ;;
+        (--disable)
+            ACTIVATION=DISABLE
+            ;;
+        (--bank=*)
+            BANK="${arg#--*=}"
+            ;;
+        (-b)
+            BANK="$1"
+            shift
+            ;;
+        (--no-bank|+b)
+            unset BANK
+            unset VLAN
+            ;;
+        (--no-vlan|+v)
+            unset VLAN
+            ;;
+        (--server=*)
+            SERVER="${arg#--*=}"
+            ;;
+        (-s)
+            SERVER="$1"
+            shift
+            ;;
+        (--crl=*)
+            CRLFILE="${arg#--*=}"
+            unset NO_CRLFILE
+            ;;
+        (--no-crl)
+            unset CRLFILE
+            NO_CRLFILE=yes
+            ;;
+        (--authz=*)
+            AUTHZFILE="${arg#--*=}"
+            unset NO_AUTHZFILE
+            ;;
+        (--no-authz)
+            NO_AUTHZFILE=yes
+            unset AUTHZFILE
+            ;;
+        (-i)
+            SSHKEYFILE="$1"
+            shift
+            ;;
+        (--ca=*)
+            CACERTFILE="${arg#--*=}"
+            unset NO_CACERTFILE
+            ;;
+        (--no-ca)
+            unset CACERTFILE
+            NO_CACERTFILE=yes
+            ;;
+        (--ovpn=*)
+            OVPNFILE="${arg#--*=}"
+            ;;
+        (--no-ovpn)
+            unset OVPNFILE
+            ;;
+        (--vlan=*)
+            VLAN="${arg#--*=}"
+            ;;
+        (-v)
+            VLAN="$1"
+            shift
+            ;;
+        (--no-network)
+            unset SUBNET
+            NO_SUBNET=yes
+            ;;
+        (--network=*)
+            SUBNET="${arg#--*=}"
+            unset NO_SUBNET
+            ;;
+        (-n)
+            SUBNET="$1"
+            unset NO_SUBNET
+            shift
+            ;;
+        (*)
+            printf >&2 '%s: unknown argument %s\n' "${0##*/}" "$arg"
+            exit 1
+            ;;
+    esac
+done
+
+## Read in SSH keys in specified files.
+for infile in "${!SSHKEYFILE[@]}" ; do
+    if [ ! -r "$infile" ] ; then
+        printf >&2 '%s: unreadable: %s\n' "$0" "$infile"
+        exit 1
+    fi
+    while read -r keytype key64 comment ; do
+        case "$keytype" in
+            (ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-ed25519|ssh-dss|ssh-rsa)
+                KEYCOMMENT["$key64"]="$comment"
+                KEYTYPE["$key64"]="$keytype"
+                ;;
+        esac
+    done < "$infile"
+done
+
+## Read in SSH keys from authorization files.
+AUTHZ_FILES+=(~/.ssh/authorized_keys)
+AUTHZ_FILES+=(~/.ssh/authorized_keys2)
+for src in "${AUTHZ_FILES[@]}" ; do
+    if [ -r "$src" ] ; then
+        #printf >&2 'Reading %s...\n' "$src"
+        while read -r keytype key64 comment ; do
+            case "$keytype" in
+                (ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|ssh-ed25519|ssh-dss|ssh-rsa)
+                    #printf >&2 '  Checking %s %s...\n' "$keytype" "$comment"
+                    for pat in "${!KEYPATTERN[@]}" ; do
+                        #printf >&2 '    Pattern %s...\n' "$pat"
+                        if ! [[ "$comment" == $pat ]] ; then
+                            continue
+                        fi
+                        KEYCOMMENT["$key64"]="$comment"
+                        KEYTYPE["$key64"]="$keytype"
+                        break
+                    done
+                    ;;
+            esac
+        done < "$src"
+    fi
+done
+
+declare -Ag SETTING
+
+## Parse the subnet argument if provided.
+if [[ "$SUBNET" =~ ^(([0-9]+)(\.([0-9]+)){3})-(([0-9]+)(\.([0-9]+)){3})/([0-9]+)$ ]] ; then
+    FROM="${BASH_REMATCH[1]}"
+    TO="${BASH_REMATCH[5]}"
+    PFXLEN="${BASH_REMATCH[9]}"
+    # printf >&2 'FROM=%s\n' "$FROM"
+    # printf >&2 'TO=%s\n' "$TO"
+    # printf >&2 'PFXLEN=%s\n' "$PFXLEN"
+    FROMNET=($(subnet2ints "$FROM/$PFXLEN"))
+    TONET=($(subnet2ints "$TO/$PFXLEN"))
+    if [ "${FROMNET[1]}" != "${TONET[1]}" ] ; then
+        printf >&2 '%s: addresses %s and %s not in same subnet\n' \
+                   "${0##*/}" "$FROM" "$TO"
+        exit 1
+    fi
+    COUNT=$((TONET[0] - FROMNET[0] + 1))
+    START=$((FROMNET[0] - FROMNET[1]))
+elif [ "$SUBNET" ] ; then
+    printf 'usage: %s %s --network=<start>-<end>/<prefix-len>\n' \
+           "${0##*/}" "$ACTION"
+    exit 1
+fi
+
+declare -A SETTING=()
+
+case "$ACTION" in
+    (test)
+        callssh <<EOF
+COMMAND=NOP
+
+EOF
+        exit "$?"
+        ;;
+
+    (admin|manage|read|forbid)
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=%s\n' "${ACTION^^}"
+            if [ -n "$BANK" ] ; then
+                printf 'BANK=%s\n' "$BANK"
+                if [ -n "$VLAN" ] ; then
+                    printf 'VLAN=%s\n' "$VLAN"
+                fi
+            fi
+
+            write_bodies SSHKEYS
+        } > /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        exit $?
+        ;;
+
+    (config)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "$VLAN" ] ; then
+            printf >&2 'No VLAN specified\n'
+            exit 1
+        fi
+        # OVPNFILE="${OVPNFILE-vlan.ovpn}"
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=FETCH-CACERT\n'
+            printf 'BANK=%s\n' "$BANK"
+            printf 'VLAN=%s\n' "$VLAN"
+            printf '\n'
+        } > /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        write_config
+        if [ "$AUTHZBODY" ] && [ "$AUTHZFILE" ] ; then
+            printf '%s' "$AUTHZBODY" > "$AUTHZFILE"
+        fi
+        wait "$pid"
+        rc=$? ; if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+        ;;
+
+    (destroy)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "$VLAN" ] ; then
+            printf >&2 'No VLAN specified\n'
+            exit 1
+        fi
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=DESTROY-VPN\n'
+            printf 'BANK=%s\n' "$BANK"
+            printf 'VLAN=%s\n' "$VLAN"
+            printf '\n'
+        } >> /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        rc=$?
+        if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+        ;;
+
+    (status)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "$VLAN" ] ; then
+            printf >&2 'No VLAN specified\n'
+            exit 1
+        fi
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=VPN-STATUS\n'
+            printf 'BANK=%s\n' "$BANK"
+            printf 'VLAN=%s\n' "$VLAN"
+            printf '\n'
+        } >> /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        rc=$?
+        if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+        if [ "$VPNSTATUS" ] ; then
+            printf '%s' "$VPNSTATUS"
+        fi
+        ;;
+
+    (clients)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "$VLAN" ] ; then
+            printf >&2 'No VLAN specified\n'
+            exit 1
+        fi
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=LIST-CLIENTS\n'
+            printf 'BANK=%s\n' "$BANK"
+            printf 'VLAN=%s\n' "$VLAN"
+            printf '\n'
+        } >> /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        rc=$?
+        if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+        if [ "$CLIENTLIST" ] ; then
+            printf '%s' "$CLIENTLIST"
+        fi
+        ;;
+
+    (list)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=LIST-VPNS\n'
+            printf 'BANK=%s\n' "$BANK"
+            if [ "$VLAN" ] ; then
+                printf 'VLAN=%s\n' "$VLAN"
+            fi
+            printf '\n'
+        } >> /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        rc=$?
+        if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+        if [ "$VPNLIST" ] ; then
+            printf '%s' "$VPNLIST"
+        fi
+        ;;
+
+    (update)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "$VLAN" ] ; then
+            printf >&2 'No VLAN specified\n'
+            exit 1
+        fi
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=UPDATE-VPN\n'
+            printf 'BANK=%s\n' "$BANK"
+            printf 'VLAN=%s\n' "$VLAN"
+            if [ "$SUBNET" ] ; then
+                printf 'SUBNET=%s/%d\n' "$(int2ip "${FROMNET[1]}")" "$PFXLEN"
+                printf 'START=%s\n' "$START"
+                printf 'COUNT=%s\n' "$COUNT"
+            elif [ "$NO_SUBNET" ] ; then
+                printf 'NO-SUBNET=yes\n'
+            fi
+            if [ "$DNSDOMAIN" ] ; then
+                printf 'DOMAIN=%s\n' "$DNSDOMAIN"
+            elif [ "$NO_DNSDOMAIN" ] ; then
+                printf 'NO-DOMAIN=yes\n'
+            fi
+            if [ "$DNSSERVER" ] ; then
+                alt="${DNSSERVER[*]}"
+                printf 'DNS=%s\n' "${alt// /,}"
+            elif [ "$NO_DNSSERVER" ] ; then
+                printf 'NO-DNS=yes\n'
+            fi
+            if [ "${ACTIVATION}" ] ; then
+                printf 'ACTIVATION=%s\n' "$ACTIVATION"
+            fi
+
+            write_bodies CRL CERT ROUTING AUTHZ
+        } >> /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        rc=$?
+        if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+        ;;
+
+    (create)
+        if [ -z "$BANK" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+
+        coproc callssh
+        pid=$!
+        IN="${COPROC[0]}"
+        OUT="${COPROC[1]}"
+        {
+            printf 'COMMAND=CREATE-VPN\n'
+            printf 'BANK=%s\n' "$BANK"
+            [ -n "$PORTCHOICE" ] && printf 'PORT=%s\n' "$PORTCHOICE"
+            [ -n "$VLAN" ] && printf 'VLAN=%s\n' "$VLAN"
+            if [ "$SUBNET" ] ; then
+                printf 'SUBNET=%s/%d\n' "$(int2ip "${FROMNET[1]}")" "$PFXLEN"
+                printf 'START=%s\n' "$START"
+                printf 'COUNT=%s\n' "$COUNT"
+            fi
+            if [ "$DNSDOMAIN" ] ; then
+                printf 'DOMAIN=%s\n' "$DNSDOMAIN"
+            elif [ "$NO_DNSDOMAIN" ] ; then
+                printf 'NO-DOMAIN=yes\n'
+            fi
+            if [ "$DNSSERVER" ] ; then
+                alt="${DNSSERVER[*]}"
+                printf 'DNS=%s\n' "${alt// /,}"
+            elif [ "$NO_DNSSERVER" ] ; then
+                printf 'NO-DNS=yes\n'
+            fi
+            if [ "${ACTIVATION}" ] ; then
+                printf 'ACTIVATION=%s\n' "$ACTIVATION"
+            fi
+
+            write_bodies CRL CERT ROUTING AUTHZ
+        } >> /dev/fd/${OUT}
+        {
+            read_header
+            read_content
+        } < /dev/fd/${IN}
+        wait "$pid"
+        rc=$?
+        if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+
+        ## Print out the VLAN that was chosen.
+        printf '%d\n' "${SETTING[VLAN]}"
+        ;;
+
+    (*)
+        show_help
+        ;;
+esac

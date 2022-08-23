@@ -1,0 +1,255 @@
+#!/bin/bash
+# -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
+
+## Copyright 2018-2020, Lancaster University
+## All rights reserved.
+## 
+## Redistribution and use in source and binary forms, with or without
+## modification, are permitted provided that the following conditions are
+## met:
+## 
+##  * Redistributions of source code must retain the above copyright
+##    notice, this list of conditions and the following disclaimer.
+## 
+##  * Redistributions in binary form must reproduce the above copyright
+##    notice, this list of conditions and the following disclaimer in the
+##    documentation and/or other materials provided with the
+##    distribution.
+## 
+##  * Neither the name of the copyright holder nor the names of
+##    its contributors may be used to endorse or promote products derived
+##    from this software without specific prior written permission.
+## 
+## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+##
+##
+## Author: Steven Simpson <https://github.com/simpsonst>
+
+VPNMGRHOME="$(readlink -f "${0%/*}")"
+VPNMGRHOME="${VPNMGRHOME%/share/vpnmgr}"
+
+if [ "$(id -u)" -ne 0 ] ; then
+    printf >&2 '%s: must run as root\n' "$0"
+    exit 1
+fi
+
+source "$VPNMGRHOME/share/vpnmgr/settings.sh"
+
+prepare_settings
+
+while [ $# -gt 0 ] ; do
+    arg="$1" ; shift
+    case "$arg" in
+        (-f)
+            SOURCE_CONFIG="$1"
+            shift
+            ;;
+        (-u)
+            VPNUSER="$1"
+            shift
+            ;;
+        (*)
+            set -- "$arg" "$@"
+            break
+            ;;
+    esac
+done
+
+complete_settings
+
+function validate_bank () {
+    if ! [[ "$bank" =~ ^[a-zA-Z][0-9a-zA-Z]*$ ]] ; then
+        printf >&2 '%s: illegal bank name: %s\n' "${0##*/}" "$bank"
+        exit 1
+    fi
+}
+
+function validate_vlan () {
+    if ! [[ "$vlan" =~ ^[0-9]+$ ]] ; then
+        printf >&2 '%s: illegal vlan id: %s\n' "${0##*/}" "$vlan"
+        exit 1
+    fi
+}
+
+function validate_crl () {
+    if [ -z "$crlfile" ] ; then return 1 ; fi
+    if ! [ -r "$crlfile" ] ; then
+        printf >&2 '%s: no crl: %s\n' "${0##*/}" "$crlfile"
+        exit 1
+    fi
+}
+
+function validate_authz () {
+    if [ -z "$authzfile" ] ; then return 1 ; fi
+    if ! [ -r "$authzfile" ] ; then
+        printf >&2 '%s: no authz: %s\n' "${0##*/}" "$authzfile"
+        exit 1
+    fi
+}
+
+function validate_ca () {
+    if [ -z "$cafile" ] ; then return 1 ; fi
+    if ! [ -r "$cafile" ] ; then
+        printf >&2 '%s: no ca: %s\n' "${0##*/}" "$cafile"
+        exit 1
+    fi
+}
+
+function validate_conf () {
+    if [ -z "$conffile" ] ; then return 1 ; fi
+    if ! [ -r "$conffile" ] ; then
+        printf >&2 '%s: no conf: %s\n' "${0##*/}" "$conffile"
+        exit 1
+    fi
+}
+
+unset bank vlan
+unset crlfile nocrl
+unset cafile noca
+unset conffile noconf
+unset authzfile noauthz
+while [ $# -gt 0 ] ; do
+    arg="$1" ; shift
+    case "$arg" in
+        (-b)
+            bank="$1" ; shift
+            ;;
+        (-v)
+            vlan="$1" ; shift
+            ;;
+
+        (--crl=*)
+            crlfile="${arg#--*=}"
+            unset nocrl
+            ;;
+        (--no-crl)
+            unset crlfile
+            nocrl=yes
+            ;;
+        (--crl)
+            unset crlfile nocrl
+            ;;
+
+        (--authz=*)
+            authzfile="${arg#--*=}"
+            unset noauthz
+            ;;
+        (--no-authz)
+            unset authzfile
+            noauthz=yes
+            ;;
+        (--authz)
+            unset authzfile noauthz
+            ;;
+
+        (--ca=*)
+            cafile="${arg#--*=}"
+            unset noca
+            ;;
+        (--no-ca)
+            unset cafile
+            noca=yes
+            ;;
+        (--ca)
+            unset cafile noca
+            ;;
+
+        (--conf=*)
+            conffile="${arg#--*=}"
+            unset noconf
+            ;;
+        (--no-conf)
+            unset conffile
+            noconf=yes
+            ;;
+        (--conf)
+            unset conffile noconf
+            ;;
+
+        (start-service)
+            validate_bank
+            validate_vlan
+            systemctl enable --now "openvpn@vpnmgr.$bank.$vlan"
+            rc=$? ; if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+            ;;
+        (stop-service)
+            validate_bank
+            validate_vlan
+            systemctl disable --now "openvpn@vpnmgr.$bank.$vlan"
+            rc=$? ; if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+            ;;
+        (restart-service)
+            validate_bank
+            validate_vlan
+            systemctl restart "openvpn@vpnmgr.$bank.$vlan"
+            rc=$? ; if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+            ;;
+        (reload-service)
+            validate_bank
+            validate_vlan
+            systemctl reload "openvpn@vpnmgr.$bank.$vlan"
+            rc=$? ; if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+            ;;
+        (status)
+            validate_bank
+            validate_vlan
+            systemctl status "openvpn@vpnmgr.$bank.$vlan"
+            rc=$? ; if [ $rc -ne 0 ] ; then exit "$rc" ; fi
+            ;;
+        (list-clients)
+            validate_bank
+            validate_vlan
+            if [ -r "/var/run/openvpn/vpnmgr.$bank.$vlan.status" ] ; then
+                cat "/var/run/openvpn/vpnmgr.$bank.$vlan.status"
+            fi
+            ;;
+
+        (configure)
+            validate_bank
+            validate_vlan
+            dest="${RTSTATDIR%/}/crl.$bank.$vlan.pem"
+            if validate_crl ; then
+                cp "$crlfile" "$dest-tmp"
+                mv "$dest-tmp" "$dest"
+            elif [ "$nocrl" ] ; then
+                rm -f "$dest"
+            fi
+            dest="${RTSTATDIR%/}/authz.$bank.$vlan.yaml"
+            if validate_authz ; then
+                cp "$authzfile" "$dest-tmp"
+                mv "$dest-tmp" "$dest"
+            elif [ "$noauthz" ] ; then
+                cp /dev/null "$dest"
+            fi
+            dest="${RTSTATDIR%/}/ca.$bank.$vlan.crt"
+            if validate_ca ; then
+                cp "$cafile" "$dest-tmp"
+                mv "$dest-tmp" "$dest"
+            elif [ "$noca" ] ; then
+                rm -f "$dest"
+            fi
+            dest="${CONFDIR%/}/vpnmgr.$bank.$vlan.conf"
+            if validate_conf ; then
+                cp "$conffile" "$dest-tmp"
+                mv "$dest-tmp" "$dest"
+            elif [ "$noconf" ] ; then
+                rm -f "$dest"
+            fi
+            ;;
+            
+        (*)
+            printf >&2 '%s: unknown argument: %s\n' "$0" "$arg"
+            exit 1
+            ;;
+    esac
+done

@@ -1,0 +1,269 @@
+#!/bin/bash
+# -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
+
+## Copyright 2018-2020, Lancaster University
+## All rights reserved.
+## 
+## Redistribution and use in source and binary forms, with or without
+## modification, are permitted provided that the following conditions are
+## met:
+## 
+##  * Redistributions of source code must retain the above copyright
+##    notice, this list of conditions and the following disclaimer.
+## 
+##  * Redistributions in binary form must reproduce the above copyright
+##    notice, this list of conditions and the following disclaimer in the
+##    documentation and/or other materials provided with the
+##    distribution.
+## 
+##  * Neither the name of the copyright holder nor the names of
+##    its contributors may be used to endorse or promote products derived
+##    from this software without specific prior written permission.
+## 
+## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+##
+##
+## Author: Steven Simpson <https://github.com/simpsonst>
+
+VPNMGRHOME="$(readlink -f "${0%/*}")"
+VPNMGRHOME="${VPNMGRHOME%/share/vpnmgr}"
+
+source "$VPNMGRHOME/share/vpnmgr/sets.sh"
+source "$VPNMGRHOME/share/vpnmgr/settings.sh"
+source "$VPNMGRHOME/share/vpnmgr/authz.sh"
+
+prepare_settings
+
+unset USE_LOCK
+while [ $# -gt 0 ] ; do
+    arg="$1" ; shift
+    case "$arg" in
+        (--lock|-l)
+            USE_LOCK=yes
+            ;;
+        (-f)
+            SOURCE_CONFIG="$1"
+            shift
+            ;;
+        (-u)
+            VPNUSER="$1"
+            shift
+            ;;
+        (*)
+            set -- "$arg" "$@"
+            break
+            ;;
+    esac
+done
+
+complete_settings
+
+if [ "$LOGNAME" != "$VPNUSER" ] ; then
+    printf >&2 'User "%s" expected; got "%s"\n' "$VPNUSER" "$LOGNAME"
+    exit 1
+fi
+
+mkdir -p "$SSHAUTHDIR" "${RUNDIR%/}/" || exit 1
+mkdir -m 700 -p ~/.ssh/ || exit 1
+
+if [ "$USE_LOCK" ] ; then
+    unset lfd
+    exec {lfd}>> "${RUNDIR%/}/root.lock"
+    flock -x "$lfd"
+fi
+
+## Apply commands.
+unset HASHID BANK VLANS
+VLANS[0]=yes
+while [ $# -gt 0 ] ; do
+    arg="$1"
+    shift
+    case "$arg" in
+        (--root)
+            unset BANK VLANS
+            VLANS[0]=yes
+            ;;
+        (--bank=*)
+            BANK="${arg#--*=}"
+            unset VLANS
+            VLANS[0]=yes
+            ;;
+        (--vlan=*)
+            unset VLANS
+            ranges2set --min=1 --max=4095 VLANS "${arg#--*=}"
+            ;;
+        (--self=*)
+            HASHID="${arg#--*=}"
+            read_authz "$HASHID"
+            ;;
+        (--admin|--manage|--read|--forbid)
+            ## Grab the key and get its hash.
+            keytype="$1" ; shift
+            key64="$1" ; shift
+            comment="$1" ; shift
+            hash="$(echo "$key64" | base64 --decode | sha1sum --binary | cut -c1-40)"
+
+            ## Unless we're removing all permissions, we need to store
+            ## the key in a file indexed by its hash.  If the key's
+            ## already there, we'll update it anyway, in case the
+            ## comment has changed.
+            case "$arg" in
+                (--forbid)
+                    ;;
+                (*)
+                    keyfile="$SSHAUTHDIR/key.$hash"
+                    printf '%s %s %s\n' "$keytype" "$key64" "$comment" \
+                           > "$keyfile-tmp"
+                    mv "$keyfile-tmp" "$keyfile"
+                    ;;
+            esac
+
+            for vlan in "${!VLANS[@]}" ; do
+                ## Identify the file to hold the key's permission.  Also
+                ## determine what to check when removing admin permission.
+                unset parcheck message authfile
+                if [ "$BANK" -a "$vlan" -ne 0 ] ; then
+                    authfile="$SSHAUTHDIR/auth.vlan.$BANK.$vlan.$hash"
+                    parcheck=(check_authz manage "$BANK")
+                    message="vlan $vlan in bank [$BANK]"
+                elif [ "$BANK" ] ; then
+                    authfile="$SSHAUTHDIR/auth.bank.$BANK.$hash"
+                    parcheck=(check_authz manage)
+                    message="bank [$BANK]"
+                else
+                    authfile="$SSHAUTHDIR/auth.root.$hash"
+                    parcheck=(false)
+                    message="root"
+                fi
+
+                ## Is the caller removing something they can't put
+                ## back?
+                oldlvl="$(cat "$authfile" 2> /dev/null)"
+                if [ "$hash" = "$HASHID" ] &&
+                       [ "$oldlvl" = admin ] &&
+                       [ "$arg" != --admin ] &&
+                       ! "${parcheck[@]}" ; then
+                    printf >&2 'Ignored unadminning of yourself!\n'
+                    continue
+                fi
+
+                ## Apply the permission change.  'forbid' results in the
+                ## file's removal.  All other levels involve writing the
+                ## new level into the file.
+                case "$arg" in
+                    (--forbid)
+                        rm -f "$authfile"
+                        ;;
+                    (*)
+                        ## Store the level in the permission file.
+                        echo "${arg#--}" > "$authfile-tmp"
+                        mv "$authfile-tmp" "$authfile"
+                        ;;
+                esac
+                printf >&2 'Set %s to %s %s\n' \
+                           "$comment" "${arg#--}" "$message"
+
+                ## Update our internal copy of the permissions so we can
+                ## determine whether subsequent changes will disable the
+                ## caller.
+                if [ "$HASHID" ] ; then read_authz "$HASHID" ; fi
+            done
+            ;;
+
+        (--clean)
+            ## A VLAN has been destroyed, so remove all permissions
+            ## for it.
+            for vlan in "${!VLANS[@]}" ; do
+                rm -f "$SSHAUTHDIR/auth.vlan.$BANK.$vlan."*
+            done
+            ;;
+    esac
+done
+
+## Read the authorization database.  This is simply a directory
+## consisting of files of the form <hash>.key (a one-line SSH public
+## key, where <hash> is the sha1sum of the key's base64 section),
+## bank-<bank>.<hash>.auth (an empty file indicating that the key with
+## the given hash is permitted to manage the specified bank),
+## vlan-<vlan>-<bank>.<hash>.auth (), and root.<hash>.auth (an empty
+## file indicating that the key with the given hash is permitted to
+## update this database).
+
+## Find all the authorization files.
+if [ -d "$SSHAUTHDIR"/ ] ; then
+    readarray -t authfiles \
+              < <(find "$SSHAUTHDIR/" -maxdepth 1 -name 'auth.*' -printf '%P\n')
+fi
+
+## Garbage-collect unnecessary keys., i.e., with no soft links to
+## them.
+declare -A keys root banks vlans
+for kf in "${authfiles[@]}" ; do
+    lvl="$(cat "$SSHAUTHDIR/$kf")"
+    kf="${kf#auth.}"
+    if hash="${kf#root.}" ; [ "$hash" != "$kf" ] ; then
+        if [ ! -r "$SSHAUTHDIR/key.$hash" ] ; then continue ; fi
+        keys["$hash"]=yes
+        root["$hash"]="$lvl"
+    elif hash="${kf#bank.}" ; [ "$hash" != "$kf" ] ; then
+        bank="${hash%%.*}"
+        hash="${hash#"${bank}".}"
+        if [ ! -r "$SSHAUTHDIR/key.$hash" ] ; then continue ; fi
+        keys["$hash"]=yes
+        banks["$hash.$bank"]="$lvl"
+    elif hash="${kf#vlan.}" ; [ "$hash" != "$kf" ] ; then
+        bank="${hash%%.*}"
+        hash="${hash#"${bank}".}"
+        vlan="${hash%%.*}"
+        hash="${hash#"${vlan}".}"
+        if [ ! -r "$SSHAUTHDIR/key.$hash" ] ; then continue ; fi
+        keys["$hash"]=yes
+        vlans["$hash.$bank.$vlan"]="$lvl"
+        banks["$hash.$bank"]+=''
+    fi
+done
+
+rmargs=()
+for hash in "${!keys[@]}" ; do
+    rmargs+=(-o -name "key.$hash")
+done
+find "$SSHAUTHDIR"/ -maxdepth 1 \
+     -regex '.*/[0-9a-f]+\.key$' \
+     -not \( -false "${rmargs[@]}" \) -print
+#-delete
+
+## Write out the new authorization rules to a temporary file.  Each
+## entry should run the SSH agent with the hash of the key authorized
+## to run it.  That way, the agent will know what permissions the
+## caller has.
+{
+    if [ -r ~/.config/vpnmgr/authorized_keys ] ; then
+        cat ~/.config/vpnmgr/authorized_keys
+    fi
+    scq="$(printf '%s' "$SOURCE_CONFIG" | sed -e 's/\([\\]\)/\\\1/g')"
+    scq="$(printf '%s' "$scq" | sed -e 's/\(["]\)/\\\\\1/g')"
+    for key in "${!keys[@]}" ; do
+        printf 'command="%s/share/vpnmgr/vpnmgr-ssh-agent' "$VPNMGRHOME"
+        printf ' -f \\\"%s\\\"' "$scq"
+        read -r keytype key64 comment < "$SSHAUTHDIR/key.$key"
+        hash="$(echo "$key64" | base64 --decode | sha1sum --binary | cut -c1-40)"
+        printf ' --hash=%s' "$hash"
+
+        printf '",no-port-forwarding,no-agent-forwarding'
+        printf ',no-X11-forwarding,no-pty %s %s %s\n' \
+               "$keytype" "$key64" "$comment"
+    done
+} > ~/.ssh/authorized_keys-tmp
+
+## Atomically move the authorization rules into place.
+mv ~/.ssh/authorized_keys-tmp ~/.ssh/authorized_keys

@@ -1,0 +1,103 @@
+#!/bin/bash
+# -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
+
+## Copyright 2018-2020, Lancaster University
+## All rights reserved.
+## 
+## Redistribution and use in source and binary forms, with or without
+## modification, are permitted provided that the following conditions are
+## met:
+## 
+##  * Redistributions of source code must retain the above copyright
+##    notice, this list of conditions and the following disclaimer.
+## 
+##  * Redistributions in binary form must reproduce the above copyright
+##    notice, this list of conditions and the following disclaimer in the
+##    documentation and/or other materials provided with the
+##    distribution.
+## 
+##  * Neither the name of the copyright holder nor the names of
+##    its contributors may be used to endorse or promote products derived
+##    from this software without specific prior written permission.
+## 
+## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+##
+##
+## Author: Steven Simpson <https://github.com/simpsonst>
+
+op="$1" ; shift
+iface="$1" ; shift
+vliface="$1" ; shift
+briface="$1" ; shift
+vlan="$1" ; shift
+tap_dev="$1" ; shift
+tap_mtu="$1" ; shift
+link_mtu="$1" ; shift
+ifconfig_local_ip="$1" ; shift
+ifconfig_local_netmask="$1" ; shift
+action="$1" ; shift
+
+case "$op" in
+    (up)
+        ## Create a VLAN child interface and a bridge.
+        /sbin/ip link add link "$iface" name "$vliface" type vlan id "$vlan"
+        /sbin/brctl addbr "$briface"
+
+        ## Some info here:
+        ## <https://vincent.bernat.ch/en/blog/2017-linux-bridge-isolation>
+
+        ## Turn off IPv6 on all these interfaces.
+        /sbin/sysctl -w "net.ipv6.conf.$vliface.disable_ipv6"=1
+        /sbin/sysctl -w "net.ipv6.conf.$briface.disable_ipv6"=1
+        /sbin/sysctl -w "net.ipv6.conf.$tap_dev.disable_ipv6"=1
+
+        ## Turn off recognition of ARPs on all these interfaces.
+        /sbin/sysctl -w "net.ipv4.conf.$vliface.arp_ignore"=8
+        /sbin/sysctl -w "net.ipv4.conf.$briface.arp_ignore"=8
+        /sbin/sysctl -w "net.ipv4.conf.$tap_dev.arp_ignore"=8
+        /sbin/sysctl -w "net.ipv4.conf.$vliface.arp_filter"=1
+        /sbin/sysctl -w "net.ipv4.conf.$briface.arp_filter"=1
+        /sbin/sysctl -w "net.ipv4.conf.$tap_dev.arp_filter"=1
+        ## These by themselves might be enough:
+        /sbin/ip link set arp off dev "$vliface"
+        /sbin/ip link set arp off dev "$briface"
+        /sbin/ip link set arp off dev "$tap_dev"
+
+        ## Turn off IPv4 on all these interfaces.  This should work so
+        ## long as they don't have IPv4 addresses.
+        /sbin/sysctl -w "net.ipv4.conf.$vliface.rp_filter"=1
+        /sbin/sysctl -w "net.ipv4.conf.$briface.rp_filter"=1
+        /sbin/sysctl -w "net.ipv4.conf.$tap_dev.rp_filter"=1
+
+        ## Connect and VLAN interface and the TAP via the bridge.
+        /sbin/brctl addif "$briface" "$vliface"
+        /sbin/brctl addif "$briface" "$tap_dev"
+
+        ## Bring them all up.
+        /sbin/ip link set dev "$tap_dev" up
+        /sbin/ip link set dev "$vliface" up mtu "$tap_mtu"
+        /sbin/ip link set dev "$briface" up mtu "$tap_mtu"
+        ;;
+
+    (down)
+        ## Delete the VLAN child interface and bridge.
+        /sbin/brctl delif "$briface" "$vliface"
+        ## This isn't needed to destroy the bridge, and OpenVPN might
+        ## have already destroyed $tap_dev.
+        #/sbin/brctl delif "$briface" "$tap_dev"
+        /sbin/ip link set dev "$vliface" down
+        /sbin/ip link delete "$vliface"
+        /sbin/ip link set dev "$briface" down
+        /sbin/brctl delbr "$briface"
+        ;;
+esac

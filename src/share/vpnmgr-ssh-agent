@@ -1,0 +1,1112 @@
+#!/bin/bash
+# -*- c-basic-offset: 4; indent-tabs-mode: nil -*-
+
+## Copyright 2018-2020, Lancaster University
+## All rights reserved.
+## 
+## Redistribution and use in source and binary forms, with or without
+## modification, are permitted provided that the following conditions are
+## met:
+## 
+##  * Redistributions of source code must retain the above copyright
+##    notice, this list of conditions and the following disclaimer.
+## 
+##  * Redistributions in binary form must reproduce the above copyright
+##    notice, this list of conditions and the following disclaimer in the
+##    documentation and/or other materials provided with the
+##    distribution.
+## 
+##  * Neither the name of the copyright holder nor the names of
+##    its contributors may be used to endorse or promote products derived
+##    from this software without specific prior written permission.
+## 
+## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+##
+##
+## Author: Steven Simpson <https://github.com/simpsonst>
+
+VPNMGRHOME="$(readlink -f "${0%/*}")"
+VPNMGRHOME="${VPNMGRHOME%/share/vpnmgr}"
+
+source "$VPNMGRHOME/share/vpnmgr/ip.sh"
+source "$VPNMGRHOME/share/vpnmgr/sets.sh"
+source "$VPNMGRHOME/share/vpnmgr/authz.sh"
+source "$VPNMGRHOME/share/vpnmgr/base62.sh"
+source "$VPNMGRHOME/share/vpnmgr/chunks.sh"
+source "$VPNMGRHOME/share/vpnmgr/header.sh"
+source "$VPNMGRHOME/share/vpnmgr/settings.sh"
+source "$VPNMGRHOME/share/vpnmgr/privileged.sh"
+
+function trace_cmd () {
+    printf >&2 '%s\n' "$*"
+    "$@" >&2
+}
+
+function create_port_mapping () {
+    local bank="$1" ; shift
+    declare -n cpme2i="$1" ; shift
+    declare -n cpmi2e="$1" ; shift
+
+    ## Convert the configured port mapping to an associative array.
+    ranges2set --min=1 --max=65535 cpme2i "${PORTRANGES["$bank"]}"
+
+    ## Create an inverse mapping.
+    invertmap cpmi2e cpme2i
+
+    ## They should be the same size, or we have a misconfiguration.
+    if [ ${#cpmi2e} -ne ${#cpme2i} ] ; then
+        printf >&2 'Misconfiguration: port mapping is not 1-1\n'
+        for p in "${!cpmi2e[@]}" ; do
+            p2="${cpmi2e["$p"]}"
+            p3="${cpme2i["$p2"]}"
+            if [ "$p" -ne "$p3" ] ; then
+                printf >&2 '  %d -> %d -> %d\n' "$p" "$p2" "$p3"
+            fi
+        done
+        return 1
+    fi
+}
+
+function show_help () {
+            cat <<EOF
+usage: $0 [options]
+-f FILE
+        Source additional configuration from FILE.
+--ca=CACERTFILE
+        Override the default CA certificate file.
+--bank=BANK
+-b BANK
+        Authorize to manage BANK.
+--hash=HASH
+        Identify caller by SHA1 of SSH public key.
+
+vpnmgr-ssh-agent manages local OpenVPN service units to access VLANs
+on a given interface, controlled by invocations of the vpnmgr SSH
+client.  It should be run from ~/.ssh/authorized_keys(2) like this:
+
+command="sudo $0 [options]",SSH-OPTIONS SSH-KEY-LINE
+
+Recommended SSH-OPTIONS:
+
+no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty
+
+SSH-KEY-LINE has the form KEY-TYPE BASE64-KEY COMMENT.  See [man
+authorized_keys].
+
+vpnmgr-ssh-agent modifies files in /etc/openvpn and
+/etc/openvpn/vpnmgr (by default), and invokes systemctl to start and
+stop OpenVPN service units, so it must be run as sudo.  It is
+recommended to create a user (vpns@somehost, say), and allowing it to
+run just vpnmgr-ssh-agent as sudo:
+
+## In /etc/sudoers.d/vpnmgr:
+vpns somehost = (root) NOPASSWD: $0
+
+vpnmgr-ssh-agent can operate multiple named 'banks' of VLAN VPNs, and
+many configuration options are bank-specific.  The default bank is
+called "default".  Each invocation of vpnmgr-ssh-agent operates on
+only one bank (as specified by -b), and callers cannot directly select
+which bank to operate on, but should use different SSH keys to select
+different lines in authorized_keys, e.g.:
+
+command="sudo $0 -b default [options]",SSH-OPTIONS SSH-KEY-LINE1
+command="sudo $0 -b other [options]",SSH-OPTIONS SSH-KEY-LINE2
+
+To define additional banks, or override settings for "default", add
+the settings to /etc/vpnmgr.sh, which is sourced before parsing
+command-line arguments.  The following settings are global, and
+affect all banks:
+
+CONFDIR=/etc/openvpn
+        The location of OpenVPN's configuration files.  You shouldn't
+        need to change this, unless you have OpenVPN installed with an
+        unusual configuration.
+
+RTSTATDIR=/etc/openvpn/server/vpnmgr
+        Additional OpenVPN configuration files managed by vpnmgr but
+        used directly by OpenVPN, such as CRLs.  You shouldn't need to
+        change this.
+
+STATDIR=/var/lib/vpnmgr/.config/vpnmgr
+        Where vpnmgr-ssh-agent stores other per-VPN state.  Again, you
+        shouldn't need to modify this.
+
+SERVERTITLE="$(hostname)"
+        Text displayed in the greeting to clients.
+
+The following settings are scoped to a given bank:
+
+IFACE[default]=eth1
+        The name of the interface on which VLANs appear.  This setting
+        must be specified to enable the bank.
+
+PORTRANGES[default]=12000-12100
+        The set of ports to allocate from.  Several comma-separated
+        ranges or individual numbers may be specified.  Each item may
+        be suffixed by :<num> giving the internal port number of the
+        first item in the range, for use when behind port forwarding.
+        For example, 12000-12100:14500 maps internal port 14500 to
+        external 12000, 14501 to 12001, etc.  This setting must be
+        specified to enable the bank.
+
+VLANS[default]=1-4095
+        The range of VLANs to choose from if the caller does not
+        specify.  Note that the caller may specify a VLAN outside this
+        range, so it should not be regarded as a security feature, nor
+        a way to prevent particular VLANs or their corresponding UDP
+        ports to be used.
+
+SERVERNAME[default]="${HOSTNAME}"
+        The --remote setting in generated OpenVPN client
+        configurations.  This is also used to bind the UDP port if
+        INTERNALNAME is not set.
+
+INTERNALNAME[default]
+        The hostname to bind the UDP port to.  This defaults to
+        ${SERVERNAME["$BANK"]}.  You should only need to set it if you
+        have to port-forward OpenVPN ports through a firewall.  In
+        that case, set SERVERNAME to the external name, and
+        INTERNALNAME to the internal host name or IP address.
+
+DHFILE[default]=/etc/openvpn/dh1024.pem
+        The file to use as the --dh OpenVPN setting on the server side.
+
+SERVERCERT[default]=/etc/openvpn/server.crt
+        The OpenVPN server's public certificate.  This is used as the
+        --cert setting on the server side.
+
+SERVERKEY[default]=/etc/openvpn/server.key
+        The OpenVPN server's private key.  This is used as the --key
+        setting on the server side, and its public component must be
+        the subject of the SERVERCERT setting.
+
+CACERT[default]=/etc/openvpn/ca.crt
+        The certificate file for the CA that can verify the OpenVPN
+        servers to clients.  The CA must have signed the certificate
+        specified by SERVERCERT.  Although this is not needed to run
+        OpenVPN servers, it is made available to vpnmgr callers to
+        pass on to OpenVPN clients.
+
+BRIFACE[default]=vlanbr
+VLIFACE[default]=vlan
+TAPIFACE[default]=vlantap
+        These are prefixes for generated, per-VLAN bridges and
+        interfaces used to access each VLAN.  These names should be
+        limited to about 13 characters, to leave room for 2 Base64
+        VLAN digits while remaining within a 15-character limit for
+        interface names.  If not specified for a given bank, they
+        default to "${bank}br", "$bank" and "${bank}tap",
+        respectively.
+
+These settings default to the value of the 'default' bank, except
+IFACE and PORTRANGES (which are not optional), INTERNALNAME (which
+defaults to SERVERNAME), and BRIFACE, VLIFACE and TAPIFACE (whose
+defaults are based on the bank name).
+
+EOF
+}
+
+function deploy_vpn_config () {
+    local bank="$1" ; shift
+    local vlan="$1" ; shift
+
+    ## Determine whether we have all the parts for a live deployment.
+    ## We need the CA certificate, the interface configuration, and
+    ## the activation flag.
+    if [ -r "${STATDIR%/}/services/file.$bank.$vlan.crt" ] &&
+       [ -r "${STATDIR%/}/services/file.$bank.$vlan.ifconfig" ] &&
+       [ -r "${STATDIR%/}/services/file.$bank.$vlan.enabled" ] ; then
+        ## Generate a fresh configuration file.
+        local servername="${INTERNALNAME["$bank"]:-"${SERVERNAME["$bank"]}"}"
+        local dhfile="${DHFILE["$bank"]:-"${DHFILE[default]}"}"
+        local iface="${IFACE["$bank"]}"
+        local serverkey="${SERVERKEY["$bank"]:-"${SERVERKEY[default]}"}"
+        local servercert="${SERVERCERT["$bank"]:-"${SERVERCERT[default]}"}"
+        local xvlan="$(base62 "$vlan")"
+        local tapiface="${TAPIFACE["$bank"]:-"${bank}tap"}$xvlan"
+        local briface="${BRIFACE["$bank"]:-"${bank}br"}$xvlan"
+        local vliface="${VLIFACE["$bank"]:-"${bank}"}$xvlan"
+        local cacrtfile="${RTSTATDIR%/}/ca.$bank.$vlan.crt"
+        local crlfile="${RTSTATDIR%/}/crl.$bank.$vlan.pem"
+        local statfile="${STATDIR%/}/services/file.$bank.$vlan.stat"
+
+        {
+            cat <<EOF
+status-version 2
+dev-type tap
+dev $tapiface
+mode server
+tls-server
+remote-cert-tls client
+dh $dhfile
+local $servername
+proto udp
+cipher AES-256-CBC
+keepalive 10 60
+verify-client-cert require
+tls-verify "$VPNMGRHOME/share/vpnmgr/authcheck $RTSTATDIR/authz.$bank.$vlan.yaml"
+key $serverkey
+cert $servercert
+up "$VPNMGRHOME/share/vpnmgr/brlink up $iface $vliface $briface $vlan"
+down "$VPNMGRHOME/share/vpnmgr/brlink down $iface $vliface $briface $vlan"
+script-security 2
+EOF
+            if [ -r "${STATDIR%/}/services/file.$bank.$vlan.crl" ] ; then
+                printf 'crl-verify %s\n' "$crlfile"
+            fi
+            if [ -r "${STATDIR%/}/services/file.$bank.$vlan.crt" ] ; then
+                printf 'ca %s\n' "$cacrtfile"
+            fi
+
+            local poolstart poolend netmask
+            read poolstart poolend netmask \
+                 < "${STATDIR%/}/services/file.$bank.$vlan.ifconfig"
+            printf 'ifconfig-pool %s %s %s\n' \
+                   "$(int2ip "$poolstart")" \
+                   "$(int2ip "$poolend")" \
+                   "$(int2ip "$netmask")"
+            local network=$((poolstart & netmask))
+
+            local rnw rnm gw metr
+            while read rnw rnm gw metr ; do
+                ## Skip routes via non-local gateways.
+                if (( (gw & netmask) != network )) ; then continue ; fi
+
+                printf 'push "route %s %s %s%s"\n' \
+                       "$(int2ip "$rnw")" \
+                       "$(int2ip "$rnm")" \
+                       "$(int2ip "$gw")" \
+                       "${metr:+ "$metr"}"
+            done < "${STATDIR%/}/services/file.$bank.$vlan.routes"
+
+            if [ -r "${STATDIR%/}/services/file.$bank.$vlan.dns" ] ; then
+                local line dummy
+                while read -r line dummy ; do
+                    printf 'push "dhcp-option DNS %s"\n' "$(int2ip "$line")"
+                done < "${STATDIR%/}/services/file.$bank.$vlan.dns"
+            fi
+
+            if [ -r "${STATDIR%/}/services/file.$bank.$vlan.domain" ] ; then
+                local line dummy
+                read -r line dummy \
+                     < "${STATDIR%/}/services/file.$bank.$vlan.domain"
+                printf 'push "dhcp-option DOMAIN %s"\n' "$line"
+            fi
+
+            cat "${STATDIR%/}/services/item.$bank.$vlan."*
+        } | tee "${STATDIR%/}/services/file.$bank.$vlan.conf" > /dev/null
+
+        ## Deploy the configuration file.
+        local confargs=(--conf="${STATDIR%/}/services/file.$bank.$vlan.conf")
+        confargs+=(--ca="${STATDIR%/}/services/file.$bank.$vlan.crt")
+        local sf="${STATDIR%/}/services/file.$bank.$vlan.crl"
+        if [ -r "$sf" ] ; then
+            confargs+=(--crl="$sf")
+        else
+            confargs+=(--no-crl)
+        fi
+        local sf="${STATDIR%/}/services/file.$bank.$vlan.authz"
+        if [ -r "$sf" ] ; then
+            confargs+=(--authz="$sf")
+        else
+            confargs+=(--no-authz)
+        fi
+        confargs+=(configure)
+        if [ -r "${CONFDIR%/}/vpnmgr.$bank.$vlan.conf" ] ; then
+            ## TODO: Maybe work out when to just reload.
+            confargs+=(restart-service)
+        else
+            confargs+=(start-service)
+        fi
+        privileged -b "$bank" -v "$vlan" "${confargs[@]}"
+    else
+        ## The service should be stopped if running.  Its
+        ## configuration files should be removed.
+        local privargs=()
+        if [ -r "${CONFDIR%/}/vpnmgr.$bank.$vlan.conf" ] ; then
+            privargs+=(stop-service)
+        fi
+        privileged -b "$bank" -v "$vlan" --no-ca --no-conf \
+                   --no-crl "${privargs[@]}" configure
+    fi
+}
+
+function update_config_files () {
+    local bank="$1" ; shift
+    local vlan="$1" ; shift
+
+    ## Modify the routing table by scanning each line, and seeing if a
+    ## modification from the caller applies.  Write all surviving
+    ## rules to a temporary file, then make it replace the original
+    ## atomically.
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.routes"
+    touch "$dest"
+    {
+        local rnw rnm gw metr
+        # declare >&2 -p rtgws rtmetrics
+        while read rnw rnm gw metr ; do
+            # printf >&2 'Modify: %s/%s %s [%d]\n' \
+            #            "$(int2ip "$rnw")" "$(int2ip "$rnm")" \
+            #            "$(int2ip "$gw")" "$metr"
+            local cidr="$rnw/$rnm"
+            if [ "${rtgws["$cidr"]}" ] ; then
+                if [ "${rtgws["$cidr"]}" = '0x00000000' ] ; then
+                    ## A gateway of zero implies deletion, so skip
+                    ## printing anything out.
+                    continue
+                fi
+
+                ## Update the entry before printing out.
+                gw="${rtgws["$cidr"]}"
+                unset rtgws[cidr]
+                if [ "${rtmetrics["$cidr"]}" = UNSET ] ; then
+                    unset metr
+                elif [ "${rtmetrics["$cidr"]}" ] ; then
+                    metr="${rtmetrics["$cidr"]}"
+                fi
+            fi
+            printf '0x%08x 0x%08x 0x%08x%s\n' \
+                   "$rnw" "$rnm" "$gw" "${metr:+ "$metr"}"
+        done < "$dest"
+        for cidr in "${!rtgws[@]}" ; do
+            rnw="${cidr%/*}"
+            rnm="${cidr#*/}"
+            gw="${rtgws["$cidr"]}"
+            metr="${rtmetrics["$cidr"]}"
+            if [ "$gw" = '0x00000000' ] ; then
+                continue
+            fi
+            # printf >&2 'Add: %s/%s %s [%d]\n' "$(int2ip "$rnw")" \
+            #            "$(int2ip "$rnm")" "$(int2ip "$gw")" "$metr"
+            printf '0x%08x 0x%08x 0x%08x%s\n' \
+                   "$rnw" "$rnm" "$gw" "${metr:+ "$metr"}"
+        done
+    } > "$dest-tmp"
+    mv "$dest-tmp" "$dest"
+
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.dns"
+    if [ "${SETTING[DNS]}" ] ; then
+        local arr=(${SETTING[DNS]//,/ })
+        printf > "$dest-tmp" '%s\n' "${arr[@]}"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[NO-DNS]}" ] ; then
+        rm -f "$dest"
+    fi
+
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.domain"
+    if [ "${SETTING[DOMAIN]}" ] ; then
+        printf > "$dest-tmp" '%s\n' "${SETTING[DOMAIN]}"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[NO-DOMAIN]}" ] ; then
+        rm -f "$dest"
+    fi
+
+    ## Get rid of a legacy file.
+    rm -f "${STATDIR%/}/services/item.$bank.$vlan.ifconfig"
+    
+    ## Record the client's interface configuration if specified.
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.ifconfig"
+    if [ "${SETTING[SUBNET]}" ] &&
+       [ "${SETTING[START]}" ] &&
+       [ "${SETTING[COUNT]}" ] ; then
+        local subnet=($(subnet2ints "${SETTING[SUBNET]}"))
+        local netmask="${subnet[2]}"
+        local start="${SETTING[START]}"
+        local count="${SETTING[COUNT]}"
+        local poolstart=$((subnet[1] + start))
+        local poolend=$((poolstart + (count - 1)))
+        printf > "$dest-tmp" '0x%08x 0x%08x 0x%08x\n' \
+               "$poolstart" "$poolend" "$netmask"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[NO-SUBNET]}" ] ; then
+        rm -f "$dest"
+    fi
+
+    ## Record the authenticating CA cert if specified.
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.crt"
+    if [ "$cert" ] ; then
+        printf '%s' "$cert" > "$dest-tmp"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[NO-CERT]}" ] ; then
+        rm -f "$dest"
+    fi
+
+    ## Record the CRL if specified.
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.crl"
+    if [ "$crl" ] ; then
+        printf '%s' "$crl" > "$dest-tmp"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[NO-CRL]}" ] ; then
+        rm -f "$dest"
+    fi
+
+    ## Record the authorization file if specified.
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.authz"
+    if [ "$authz_yaml" ] ; then
+        printf '%s' "$authz_yaml" > "$dest-tmp"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[NO-AUTHZ]}" ] ; then
+        rm -f "$dest"
+    fi
+
+    ## Update the activation flag, if specified.
+    local dest="${STATDIR%/}/services/file.$bank.$vlan.enabled"
+    if [ "${SETTING[ACTIVATION]^^}" = "ENABLE" ] ; then
+        echo yes > "$dest-tmp"
+        mv "$dest-tmp" "$dest"
+    elif [ "${SETTING[ACTIVATION]^^}" = "DISABLE" ] ; then
+        rm -f "$dest"
+    fi
+}
+
+prepare_settings
+
+unset HASHID
+while [ $# -gt 0 ] ; do
+    arg="$1" ; shift
+    case "$arg" in
+        (--ca=*)
+            CACERT[default]="${arg#--*=}"
+            ;;
+        (--hash=*)
+            HASHID="${arg#--*=}"
+            ;;
+        (-f)
+            SOURCE_CONFIG="$1"
+            shift
+            ;;
+        (-h|--help)
+            show_help
+            exit
+            ;;
+        (*)
+            printf >&2 '%s: unknown argument: %s\n' "$0" "$arg"
+            exit 1
+            ;;
+    esac
+done
+
+complete_settings
+
+
+printf >&2 'VLAN-VPN manager %s\n' "$SERVERTITLE"
+
+mkdir -p "${STATDIR%/}/services/"
+
+## Read the request header.
+declare -Ag SETTING
+read_header
+
+## Read any message bodies specified by the CONTENT field.
+unset CONTENT
+# printf >&2 'Content: [%s]\n' "${SETTING[CONTENT]}"
+mapfile -d ' ' -t CONTENT < <(printf '%s' "${SETTING[CONTENT]^^}")
+# declare >&2 -p CONTENT
+unset cert crl authz_yaml
+declare -A comments=() keytypes=() rtmetrics=() rtgws=()
+for content in "${CONTENT[@]}" ; do
+    case "$content" in
+        ("")
+            true
+            ;;
+
+        (CRL)
+            crl="$(decode_chunks)"
+            crl="${crl:0:-1}"
+            printf >&2 'Accepted CRL\n'
+            ;;
+        (AUTHZ)
+            authz_yaml="$(decode_chunks)"
+            authz_yaml="${authz_yaml:0:-1}"
+            printf >&2 'Accepted authorization file\n'
+            ;;
+        (CERT)
+            cert="$(decode_chunks)"
+            cert="${cert:0:-1}"
+            printf >&2 'Accepted CA certificate authenticating clients\n'
+            ;;
+        (ROUTING)
+            while read -r nw nm gw metr ; do
+                # printf >&2 'Route command: %s %s %s [%s]\n' "$nw" "$nm" \
+                #            "$gw" "$metr"
+                cidr="$nw/$nm"
+                rtgws["$cidr"]="$gw"
+                rtmetrics["$cidr"]="$metr"
+            done < <(decode_chunks)
+            printf >&2 'Accepted routing modifications\n'
+            ;;
+        (SSHKEYS)
+            declare -A comments=() keytypes=()
+            while read -r keytype key64 comment ; do
+                comments["$key64"]="$comment"
+                keytypes["$key64"]="$keytype"
+            done < <(decode_chunks)
+            printf >&2 'Accepted SSH public keys\n'
+            ;;
+        (*)
+            printf >&2 'Warning: request content %s ignored\n' "$content"
+            decode_chunks > /dev/null
+            ;;
+    esac
+done
+
+## Get the command, and act on it.
+cmd="${SETTING[COMMAND]^^}"
+case "$cmd" in
+    (NOP)
+        printf >&2 'Okay\n'
+        exit
+        ;;
+
+    (ADMIN|MANAGE|READ|FORBID)
+        args=()
+        authcheck=()
+
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]}"
+        for vlan in "${!vlans[@]}" ; do
+            args=(--vlan="$vlan")
+            authcheck+=("$vlan")
+        done
+
+        bank="${SETTING[BANK]}"
+        if [ "$bank" ] ; then
+            args=(--bank="$bank" "${args[@]}")
+            authcheck=("$bank" "${authcheck[@]}")
+        fi
+
+        args=(--self="$HASHID" "${args[@]}")
+        for key64 in "${!keytypes[@]}" ; do
+            args+=(--"${cmd,,}" "${keytypes["$key64"]}" \
+                     "$key64" "${comments["$key64"]}")
+        done
+
+        mkdir -p "${RUNDIR%/}/"
+        {
+            flock -x 8
+
+            read_authz "$HASHID"
+            if ! check_authz admin "${authcheck[@]}" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            ## If a bank is specified, it must exist.
+            if [ "$bank" ] ; then
+                if [ -z "${IFACE["$bank"]}" ] ||
+                       [ -z "${PORTRANGES["$bank"]}" ] ; then
+                    printf >&2 'No such bank: %s\n' "$bank"
+                    exit 1
+                fi
+            fi
+
+            ## Check that each of the specified VLANs exists in the
+            ## bank.
+            for vlan in "${!vlans[@]}" ; do
+                if [ ! -r "${STATDIR%/}/services/item.$bank.$vlan.port" ]
+                then
+                    printf >&2 'No such VLAN in bank %s: %s\n' "$bank" "$vlan"
+                    exit 1
+                fi
+            done
+
+            rebuild_auth "${args[@]}"
+        } 8>> "${RUNDIR%/}/root.lock"
+        printf '\n'
+        ;;
+
+    (FETCH-CACERT)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]}"
+        if [ ${#vlans[@]} -gt 1 ] ; then
+            printf >&2 'Can only handle one VLAN at a time: %s\n' \
+                       "${SETTING[VLAN]}"
+            exit 1
+        fi
+        unset authzfile
+        if [ ${#vlans[@]} -eq 1 ] ; then
+            vlan=("${!vlans[@]}")
+
+            ## Check to see if the VLAN exists and what port it uses.
+            mkdir -p "${RUNDIR%/}/"
+            {
+                flock -s 8
+
+                if [ ! -r "${STATDIR%/}/services/item.$bank.$vlan.port" ] ; then
+                    printf >&2 'No such VLAN: %d\n' "$vlan"
+                    exit 1
+                fi
+
+                read_authz "$HASHID"
+                if ! check_authz read "$bank" "$vlan" ; then
+                    printf >&2 'Forbidden!\n'
+                    exit 1
+                fi
+
+                ## The 'manage' rank is required to read the
+                ## authorization file.
+                if check_authz manage "$bank" "$vlan" ; then
+                    authzfile="${STATDIR%/}/services/file.$bank.$vlan.authz"
+                    if [ -r "$authzfile" ] ; then
+                        authzdata=$(< "$authzfile")
+                    fi
+                fi
+
+                port=$(egrep '^lport ' \
+                             "${STATDIR%/}/services/item.$bank.$vlan.port" | \
+                                 cut -c7-)
+            } 8>> "${RUNDIR%/}/root.lock"
+
+            PORT_EXT2INT=()
+            PORT_INT2EXT=()
+            if ! create_port_mapping "$bank" PORT_EXT2INT PORT_INT2EXT ; then
+                exit 1
+            fi
+
+            extport="${PORT_INT2EXT["$port"]}"
+            servername="${SERVERNAME["$bank"]}"
+            dn="$(openssl x509 \
+                          -noout -subject \
+                                -in "${SERVERCERT["$bank"]}" \
+                          -nameopt RFC2253,-dn_rev,sep_comma_plus_space)"
+            dn="${dn#subject=}"
+            printf 'HOST=%s\n' "$servername"
+            printf 'PORT=%s\n' "$extport"
+            printf 'VLAN=%s\n' "$vlan"
+            printf 'SUBJECT=%s\n' "$dn"
+        fi
+        printf 'CONTENT=CACERT%s\n' "${authzdata:+ AUTHZ}"
+        printf '\n'
+        printf >&2 'Returning CA certificate authenticating server\n'
+        {
+            cat "${CACERT["$bank"]}"
+            printf 'x'
+        } | encode_chunks
+        if [ "$authzdata" ] ; then
+            printf >&2 'Returning authorization file\n'
+            {
+                printf '%sx' "$authzdata"
+            } | encode_chunks
+        fi
+        ;;
+
+    (DESTROY-VPN)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        ## Parse the VLANs.
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]}"
+        if [ ${#vlans[@]} -ne 1 ] ; then
+            printf >&2 'Can only handle one VLAN at a time: %s\n' \
+                       "${SETTING[VLAN]}"
+            exit 1
+        fi
+        vlan=("${!vlans[@]}")
+
+        ## Claim the lock to check authorization and existence of the
+        ## VPN.
+        mkdir -p "${RUNDIR%/}/"
+        {
+            flock -x 8
+
+            read_authz "$HASHID"
+            if ! check_authz manage "$bank" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            if [ -r "${STATDIR%/}/services/item.$bank.$vlan.port" ] ; then
+                ## Stop the service, and remove all state.
+                rm -f "${STATDIR%/}/services/item.$bank.$vlan."*
+                rm -f "${STATDIR%/}/services/file.$bank.$vlan."*
+                deploy_vpn_config "$bank" "$vlan"
+                rebuild_auth --bank="$bank" --vlan="$vlan" --clear
+            else
+                ## If the VPN doesn't exist, it's not an error, since
+                ## it's not supposed to.
+                printf >&2 'VLAN %d in bank %s does not exist\n' \
+                           "$vlan" "$bank"
+            fi
+        } 8>> "${RUNDIR%/}/root.lock"
+        printf '\n'
+        exit 0
+        ;;
+
+    (UPDATE-VPN)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        ## Parse the VLANs.
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]}"
+        if [ ${#vlans[@]} -ne 1 ] ; then
+            printf >&2 'Can only handle one VLAN at a time: %s\n' \
+                       "${SETTING[VLAN]}"
+            exit 1
+        fi
+        vlan=("${!vlans[@]}")
+
+        ## Claim the lock to check authorization and existence of the
+        ## VPN.
+        mkdir -p "${RUNDIR%/}/"
+        {
+            flock -x 8
+
+            read_authz "$HASHID"
+            if ! check_authz manage "$bank" "$vlan" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            if [ ! -r "${STATDIR%/}/services/item.$bank.$vlan.port" ] ; then
+                printf >&2 'No such VLAN in bank %s: %s\n' "$bank" "$vlan"
+                exit 1
+            fi
+
+            update_config_files "$bank" "$vlan"
+            deploy_vpn_config "$bank" "$vlan"
+        } 8>> "${RUNDIR%/}/root.lock"
+        printf '\n'
+        exit 0
+        ;;
+
+    (CREATE-VPN)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        PORT_EXT2INT=()
+        PORT_INT2EXT=()
+        if ! create_port_mapping "$bank" PORT_EXT2INT PORT_INT2EXT ; then
+            exit 1
+        fi
+
+        ## Parse the VLANs.
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]:-1-4095}"
+        # {
+        #     printf 'Requested VLANs:'
+        #     printf ' %s' "${!vlans[@]}"
+        #     printf '\n'
+        # } >&2
+
+        ## Retain only VLANs permitted by this bank.
+        confvlans=()
+        ranges2set --min=1 --max=4095 confvlans "${VLANS["$bank"]:-1-4095}"
+        # {
+        #     printf 'Configured VLANs: [%s]' "${VLANS["$bank"]}"
+        #     printf ' %s' "${!confvlans[@]}"
+        #     printf '\n'
+        # } >&2
+        retainkeys vlans "${!confvlans[@]}"
+
+        ## Claim the lock to perform check authorization, and
+        ## port/VLAN availability.
+        mkdir -p "${RUNDIR%/}/" "${STATDIR%/}/"
+        {
+            flock -x 8
+
+            read_authz "$HASHID"
+            if ! check_authz manage "$bank" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            ## Eliminate VLANs in use.
+            for vlan in "${!vlans[@]}" ; do
+                if [ -r "${STATDIR%/}/services/item.$bank.$vlan.port" ] ; then
+                    unset vlans["$vlan"]
+                fi
+            done
+            if [ ${#vlans[@]} -eq 0 ] ; then
+                printf >&2 'No VLANs available in %s\n' "$bank"
+                exit 1
+            fi
+
+            ## Eliminate ports in use.
+            shopt -s nullglob
+            removekeys PORT_INT2EXT \
+                       $(egrep '^lport ' "${STATDIR%/}/services/item."*.*.port \
+                               /dev/null | cut -c7-)
+
+            ## Narrow the potential ports to those offered by the
+            ## caller.
+            if [ "${SETTING[PORT]}" ] ; then
+                offeredports=()
+                ranges2set --min=1 --max=65535 offeredports "${SETTING[PORT]}"
+                retainkeys PORT_EXT2INT "${!offeredports[@]}"
+            fi
+
+            ## Stop if all ports have been eliminated.
+            retainkeys PORT_INT2EXT "${PORT_EXT2INT[@]}"
+            if [ ${#PORT_INT2EXT[@]} -eq 0 ] ; then
+                printf >&2 'No ports available\n'
+                exit 1
+            fi
+
+            ## Choose a random VLAN.
+            vlans=("${!vlans[@]}")
+            idx=$((RANDOM % ${#vlans[@]}))
+            vlan=${vlans[$idx]}
+
+            ## Choose a random port.
+            ports=("${!PORT_INT2EXT[@]}")
+            port="${ports[$((RANDOM % ${#ports[@]}))]}"
+            extport="${PORT_INT2EXT["$port"]}"
+
+            ## Ensure no debris is left over from a previous
+            ## incarnation.
+            rm -f "${STATDIR%/}/services/item.$bank.$vlan."*
+            rm -f "${STATDIR%/}/services/file.$bank.$vlan."*
+            # privileged -b "$bank" -v "$vlan" \
+            #            --no-conf --no-crl --no-ca configure
+            rebuild_auth --bank="$bank" --vlan="$vlan" --clear
+
+            ## Record the port.
+            dest="${STATDIR%/}/services/item.$bank.$vlan.port"
+            tee "$dest-tmp" > /dev/null <<EOF
+lport $port
+EOF
+            mv "$dest-tmp" "$dest"
+
+            update_config_files "$bank" "$vlan"
+            deploy_vpn_config "$bank" "$vlan"
+        } 8>> "${RUNDIR%/}/root.lock"
+        printf >&2 "Created VPN on port %s to VLAN %s\n" \
+                   "$extport" "$vlan"
+        printf 'VLAN=%d\n' "$vlan"
+        printf 'PORT=%d\n' "$extport"
+        printf '\n'
+        exit 0
+        ;;
+
+    (VPN-STATUS)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        ## Parse the VLANs.
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]}"
+        if [ ${#vlans[@]} -ne 1 ] ; then
+            printf >&2 'Can only handle one VLAN at a time: %s\n' \
+                       "${SETTING[VLAN]}"
+            exit 1
+        fi
+        vlan=("${!vlans[@]}")
+
+        ## Claim the lock to check authorization and existence of the
+        ## VPN.
+        mkdir -p "${RUNDIR%/}/"
+        {
+            flock -s 8
+
+            read_authz "$HASHID"
+            if ! check_authz manage "$bank" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            if [ -r "${STATDIR%/}/services/item.$bank.$vlan.port" ] ; then
+                if [ -r "${CONFDIR%/}/vpnmgr.$bank.$vlan.conf" ] ; then
+                    printf 'CONDITION=ACTIVE\n'
+                    printf 'CONTENT=VPNSTATUS\n'
+                    printf '\n'
+                    {
+                        privileged -b "$bank" -v "$vlan" status 2>&1
+                        printf 'x'
+                    } | encode_chunks
+                else
+                    printf 'CONDITION=INACTIVE\n'
+                    printf '\n'
+                fi
+            else
+                printf 'CONDITION=NON-EXISTENT\n'
+                printf '\n'
+            fi
+        } 8>> "${RUNDIR%/}/root.lock"
+        exit 0
+        ;;
+
+    (LIST-CLIENTS)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        ## Parse the VLANs.
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]}"
+        if [ ${#vlans[@]} -ne 1 ] ; then
+            printf >&2 'Can only handle one VLAN at a time: %s\n' \
+                       "${SETTING[VLAN]}"
+            exit 1
+        fi
+        vlan=("${!vlans[@]}")
+
+        ## Claim the lock to check authorization and existence of the
+        ## VPN.
+        mkdir -p "${RUNDIR%/}/"
+        {
+            flock -s 8
+
+            read_authz "$HASHID"
+            if ! check_authz manage "$bank" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            if [ -r "${STATDIR%/}/services/item.$bank.$vlan.port" ] ; then
+                if [ -r "${CONFDIR%/}/vpnmgr.$bank.$vlan.conf" ] ; then
+                    printf 'CONDITION=ACTIVE\n'
+                    printf 'CONTENT=CLIENTLIST\n'
+                    printf '\n'
+                    {
+                        privileged -b "$bank" -v "$vlan" list-clients
+                        printf 'x'
+                    } | encode_chunks
+                else
+                    printf 'CONDITION=INACTIVE\n'
+                    printf '\n'
+                fi
+            else
+                printf 'CONDITION=NON-EXISTENT\n'
+                printf '\n'
+            fi
+        } 8>> "${RUNDIR%/}/root.lock"
+        exit 0
+        ;;
+
+    (LIST-VPNS)
+        ## A valid bank must be specified.
+        bank="${SETTING[BANK]}"
+        if [ -z "$bank" ] ; then
+            printf >&2 'No bank specified\n'
+            exit 1
+        fi
+        if [ -z "${IFACE["$bank"]}" ] ||
+               [ -z "${PORTRANGES["$bank"]}" ] ; then
+            printf >&2 'No such bank: %s\n' "$bank"
+            exit 1
+        fi
+
+        PORT_EXT2INT=()
+        PORT_INT2EXT=()
+        if ! create_port_mapping "$bank" PORT_EXT2INT PORT_INT2EXT ; then
+            exit 1
+        fi
+
+        ## Parse the VLANs.
+        vlans=()
+        ranges2set --min=1 --max=4095 vlans "${SETTING[VLAN]:-1-4095}"
+
+        ## Claim the lock to check authorization and determine
+        ## existence of the VPNs.
+        mkdir -p "${RUNDIR%/}/"
+        {
+            flock -s 8
+
+            read_authz "$HASHID"
+            if ! check_authz manage "$bank" ; then
+                printf >&2 'Forbidden!\n'
+                exit 1
+            fi
+
+            printf 'CONTENT=VPNLIST\n'
+            printf '\n'
+            {
+                for vlan in "${!vlans[@]}" ; do
+                    if [ -r "${STATDIR%/}/services/item.$bank.$vlan.port" ]
+                    then
+                        ## Extract the port number, and map it to its
+                        ## external value.
+                        conffile="${STATDIR%/}/services/item.$bank.$vlan.port"
+                        port=$(egrep '^lport ' "$conffile" | cut -c7-)
+                        port="${PORT_INT2EXT["$port"]}"
+
+                        ## Determine VPN activity.
+                        if [ -r "${CONFDIR%/}/vpnmgr.$bank.$vlan.conf" ]
+                        then
+                            status=ACTIVE
+                        else
+                            status=INACTIVE
+                        fi
+
+                        printf '%d %d %s\n' "$vlan" "$port" "$status"
+                    fi
+                done
+                printf 'x'
+            } | encode_chunks
+        } 8>> "${RUNDIR%/}/root.lock"
+        exit 0
+        ;;
+
+    (*)
+        printf >&2 'Command %s not recognized\n' "$cmd"
+        exit 1
+        ;;
+esac
